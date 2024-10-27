@@ -1,0 +1,190 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <signal.h>
+#include <errno.h>
+#include <time.h>
+
+#define PORT 8080
+#define BUFFER_SIZE 1024
+#define INITIAL_ZOMBIES 5
+#define MAX_RETRIES 5
+#define RETRY_DELAY 2
+
+int server_socket, client_socket[2];
+struct sockaddr_in server_addr, client_addr[2];
+socklen_t client_len = sizeof(struct sockaddr_in);
+
+int player_bhoots[2] = {INITIAL_ZOMBIES, INITIAL_ZOMBIES};
+int player_correct_answers[2] = {0, 0};
+pthread_mutex_t game_mutex = PTHREAD_MUTEX_INITIALIZER;
+int game_over = 0;
+
+void send_to_client(int client_index, const char* message) {
+    if (send(client_socket[client_index], message, strlen(message), 0) < 0) {
+        perror("Failed to send message to client");
+    }
+}
+
+// Add this function declaration before the handle_client function
+// void update_bhoot_count(int player_index, int change);
+
+void update_bhoot_count(int player_index, int change) {
+    int opponent = 1 - player_index;
+    player_bhoots[player_index] -= change;
+    player_bhoots[opponent] += change;
+    player_correct_answers[player_index] += change;
+
+    // Ensure bhoot counts don't go below 0
+    if (player_bhoots[player_index] < 0) player_bhoots[player_index] = 0;
+    if (player_bhoots[opponent] < 0) player_bhoots[opponent] = 0;
+}
+
+void *handle_client(void *arg) {
+    int index = *(int*)arg;
+    char buffer[BUFFER_SIZE];
+    int read_size;
+
+    while ((read_size = recv(client_socket[index], buffer, BUFFER_SIZE, 0)) > 0) {
+        buffer[read_size] = '\0';
+        int result = atoi(buffer);
+
+        pthread_mutex_lock(&game_mutex);
+        
+        if (!game_over) {
+            if (result == 1) {
+                update_bhoot_count(index, 1);
+            }
+            
+            if (player_bhoots[0] == 0 || player_bhoots[1] == 0) {
+                game_over = 1;
+            }
+        }
+        
+        char update[BUFFER_SIZE];
+        snprintf(update, BUFFER_SIZE, "%d %d %d %d", player_bhoots[0], player_bhoots[1], 
+                 player_correct_answers[0], player_correct_answers[1]);
+        send_to_client(0, update);
+        send_to_client(1, update);
+
+        pthread_mutex_unlock(&game_mutex);
+
+        if (game_over) {
+            printf("Game over! Player %d wins!\n", player_bhoots[0] == 0 ? 1 : 2);
+            close(client_socket[0]);
+            close(client_socket[1]);
+            break;
+        }
+    }
+
+    return NULL;
+}
+
+void sigint_handler(int sig) {
+    printf("Closing server...\n");
+    close(server_socket);
+    close(client_socket[0]);
+    close(client_socket[1]);
+    exit(0);
+}
+
+int main() {
+    pthread_t client_thread[2];
+    int thread_args[2] = {0, 1};
+    int connected_players = 0;
+
+    signal(SIGINT, sigint_handler);
+
+    server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_socket == -1) {
+        perror("Could not create socket");
+        return 1;
+    }
+
+    int opt = 1;
+    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt");
+        return 1;
+    }
+
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(PORT);
+
+    if (bind(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Bind failed");
+        return 1;
+    }
+
+    if (listen(server_socket, 2) < 0) {
+        perror("Listen failed");
+        return 1;
+    }
+
+    printf("Server started. Waiting for players to connect...\n");
+
+    for (int i = 0; i < 2; i++) {
+        int retries = 0;
+        while (retries < MAX_RETRIES) {
+            printf("Waiting for Player %d to connect (attempt %d)...\n", i+1, retries+1);
+            client_socket[i] = accept(server_socket, (struct sockaddr *)&client_addr[i], &client_len);
+            if (client_socket[i] < 0) {
+                if (errno == EINTR) {
+                    // Interrupted system call, retry
+                    continue;
+                }
+                perror("Accept failed");
+                retries++;
+                sleep(RETRY_DELAY);
+            } else {
+                break;
+            }
+        }
+
+        if (retries == MAX_RETRIES) {
+            printf("Failed to accept Player %d after %d attempts. Exiting.\n", i+1, MAX_RETRIES);
+            return 1;
+        }
+
+        printf("Player %d connected from %s:%d\n", i+1, inet_ntoa(client_addr[i].sin_addr), ntohs(client_addr[i].sin_port));
+
+        char index_buffer[2];
+        snprintf(index_buffer, sizeof(index_buffer), "%d", i);
+        if (send(client_socket[i], index_buffer, strlen(index_buffer), 0) < 0) {
+            perror("Failed to send player index");
+            return 1;
+        }
+
+        connected_players++;
+    }
+
+    printf("Both players connected. Sending start signal...\n");
+
+    // Send a "start game" signal to both clients
+    const char* start_signal = "START";
+    send_to_client(0, start_signal);
+    send_to_client(1, start_signal);
+
+    printf("Start signal sent. Creating client threads...\n");
+
+    for (int i = 0; i < 2; i++) {
+        if (pthread_create(&client_thread[i], NULL, handle_client, (void*)&thread_args[i]) < 0) {
+            perror("Could not create client thread");
+            return 1;
+        }
+    }
+
+    for (int i = 0; i < 2; i++) {
+        pthread_join(client_thread[i], NULL);
+    }
+
+    printf("Game over! Closing server...\n");
+    close(server_socket);
+
+    return 0;
+}
