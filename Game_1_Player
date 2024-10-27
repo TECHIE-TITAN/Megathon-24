@@ -1,0 +1,117 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+
+const int n = 8;
+
+void print(int grid[n][n]) {
+    printf("┌───┬───┬───┬───┬───┬───┬───┬───┐\n");
+    for (int i = 0; i < n; i++) {
+        
+        for (int j = 0; j < n; j++) {
+            if (grid[i][j] == 111) {
+                printf("│ X ");
+            } else if (grid[i][j] == 222) {
+                printf("│ O ");
+            } else if (grid[i][j] == 0) {
+                printf("│   ");
+            } else {
+                printf("│%3d", grid[i][j]);
+            }
+        }
+        printf("│\n");
+        if (i < n - 1) {
+            printf("├───┼───┼───┼───┼───┼───┼───┼───┤\n");
+        }
+    }
+    printf("└───┴───┴───┴───┴───┴───┴───┴───┘\n");
+}
+
+void clear_screen() {
+    #ifdef _WIN32
+        system("cls");
+    #else
+        system("clear");
+    #endif
+}
+
+int main() {
+    int sock;
+    int win_status;
+    struct sockaddr_in server_addr;
+    char input[2];
+    int sum = 0;
+
+    // Static 2D array for the grid
+    int grid[n][n];
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    server_addr.sin_port = htons(8080);
+
+    connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr));
+    
+    // Receive starting position
+    int x = 0, y = 0; int turn_status;
+    read(sock, &x, sizeof(int));
+    read(sock, &y, sizeof(int));
+    
+    // Receive initial grid
+    read(sock, grid, n * n * sizeof(int));
+    read(sock, &turn_status, sizeof(turn_status));
+
+    while (1) {
+        clear_screen();
+        printf("Score: %d\n", sum);
+        print(grid);
+
+        if (turn_status == 1) {
+            printf("Enter move (w/a/s/d): ");
+            scanf("%1s", input);
+            write(sock, input, sizeof(input));
+        } else {
+            printf("Waiting for other player's move...\n");
+        }
+
+        // Receive updated game state
+        int bytes_read = read(sock, grid, n * n * sizeof(int));
+        if (bytes_read <= 0) {
+            printf("Server disconnected. Game over.\n");
+            break;
+        }
+
+        read(sock, &sum, sizeof(int));
+        read(sock, &win_status, sizeof(int));
+
+        if (win_status != -1) {
+            break;  // Game has ended
+        }
+
+        read(sock, &turn_status, sizeof(int));
+        usleep(100000);  // Short delay
+    }
+
+    // Display final result
+    clear_screen();
+    print(grid);
+    printf("Final Score: %d\n", sum);
+
+    if (win_status == 1) {
+        printf("YOU WIN!!!\n");
+    } else if (win_status == 0) {
+        printf("YOU LOSE!!!\n");
+    } else if (win_status == 2) {
+        printf("IT'S A TIE!!!\n");
+    }
+
+    // Close the socket
+    close(sock);
+    printf("Press Enter to exit...");
+    getchar();
+    getchar();  // Wait for user input before closing
+
+    return 0;
+}
