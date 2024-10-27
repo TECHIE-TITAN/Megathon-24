@@ -1,0 +1,155 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <time.h>
+
+const int n = 8;
+
+void print(int grid[n][n]) {
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            printf("%3d ", grid[i][j]);
+        }
+        printf("\n");
+    }
+}
+
+void initialize_grid(int grid[n][n]) {
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            grid[i][j] = rand() % 100; // Fill the grid with random values
+        }
+    }
+}
+
+void handle_players(int sock1, int sock2, int grid[n][n], int start_x[2], int start_y[2]) {
+    int current_player = 0; // 0 for Player 1, 1 for Player 2
+    char input[2];
+    int sum[2] = {0, 0};
+
+    int turn_indicator1 = 1; // Player 1's turn status
+    int turn_indicator2 = 0; // Player 2's turn status
+    write(sock1, &turn_indicator1, sizeof(turn_indicator1));
+    write(sock2, &turn_indicator2, sizeof(turn_indicator2));
+
+    while (1) {
+        int sock = (current_player == 0) ? sock1 : sock2;
+        printf("Player %d's turn\n", current_player + 1);
+
+        // Get move from the current player
+        read(sock, input, sizeof(input));
+
+        // Move based on input
+        int new_x = start_x[current_player];
+        int new_y = start_y[current_player];
+        if (strcmp(input, "w") == 0 && new_x > 0) new_x--;
+        else if (strcmp(input, "a") == 0 && new_y > 0) new_y--;
+        else if (strcmp(input, "s") == 0 && new_x < n - 1) new_x++;
+        else if (strcmp(input, "d") == 0 && new_y < n - 1) new_y++;
+        else {
+            printf("Player %d made an invalid move!\n", current_player + 1);
+            continue; // Skip turn if move is invalid
+        }
+
+        // Check if the new position is occupied by the other player
+        if ((current_player == 0 && grid[new_x][new_y] == 222) ||
+            (current_player == 1 && grid[new_x][new_y] == 111)) {
+            printf("Player %d moved to the same square as the other player!\n", current_player + 1);
+            // Game ends, determine winner
+            int win_1, win_2;
+            if (sum[0] > sum[1]) {
+                win_1 = 1; win_2 = 0;
+            } else if (sum[1] > sum[0]) {
+                win_1 = 0; win_2 = 1;
+            } else {
+                win_1 = 2; win_2 = 2; // Tie
+            }
+            
+            // Send final state to both players
+            write(sock1, grid, n * n * sizeof(int));
+            write(sock1, &sum[0], sizeof(int));
+            write(sock1, &win_1, sizeof(int));
+            
+            write(sock2, grid, n * n * sizeof(int));
+            write(sock2, &sum[1], sizeof(int));
+            write(sock2, &win_2, sizeof(int));
+            
+            return; // End the game
+        }
+
+        // Move is valid, update the grid
+        sum[current_player] += grid[new_x][new_y]; // Add score before updating position
+        grid[start_x[current_player]][start_y[current_player]] = 0; // Clear old position
+        start_x[current_player] = new_x;
+        start_y[current_player] = new_y;
+        grid[start_x[current_player]][start_y[current_player]] = current_player == 0 ? 111 : 222; // Mark new position
+
+        // Send updated state to both players
+        int win_status = -1; // Game continues
+        write(sock1, grid, n * n * sizeof(int));
+        write(sock1, &sum[0], sizeof(int));
+        write(sock1, &win_status, sizeof(int));
+        
+        write(sock2, grid, n * n * sizeof(int));
+        write(sock2, &sum[1], sizeof(int));
+        write(sock2, &win_status, sizeof(int));
+
+        // Switch player
+        current_player = !current_player;
+        turn_indicator1 = (current_player == 0) ? 1 : 0;
+        turn_indicator2 = (current_player == 1) ? 1 : 0;
+        write(sock1, &turn_indicator1, sizeof(turn_indicator1));
+        write(sock2, &turn_indicator2, sizeof(turn_indicator2));
+    }
+}
+
+int main() {
+    srand(time(NULL));
+    
+    // Use a static 2D array for the grid
+    int grid[n][n];
+
+    int server_sock, client_sock[2];
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t addr_size = sizeof(client_addr);
+
+    server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(8080);
+
+    bind(server_sock, (struct sockaddr*)&server_addr, sizeof(server_addr));
+    listen(server_sock, 2);
+
+    // Initialize grid once for both players
+    initialize_grid(grid);
+
+    int start_x[2], start_y[2]; // Starting positions for both players
+    start_x[0] = rand() % n; start_y[0] = rand() % n; // Player 1's starting position
+    do {
+        start_x[1] = rand() % n; start_y[1] = rand() % n; // Player 2's starting position
+    } while (start_x[1] == start_x[0] && start_y[1] == start_y[0]); // Ensure different starting positions
+
+    // Set both players' initial positions in the grid
+    grid[start_x[0]][start_y[0]] = 111; // Player 1 (X)
+    grid[start_x[1]][start_y[1]] = 222; // Player 2 (O)
+
+    for (int i = 0; i < 2; i++) {
+        client_sock[i] = accept(server_sock, (struct sockaddr*)&client_addr, &addr_size);
+        printf("Player %d connected\n", i + 1);
+
+        // Send the initial position and grid to both players
+        write(client_sock[i], &start_x[i], sizeof(int));
+        write(client_sock[i], &start_y[i], sizeof(int));
+        write(client_sock[i], grid, n * n * sizeof(int));
+    }
+
+    handle_players(client_sock[0], client_sock[1], grid, start_x, start_y); // Handle both players
+
+    // Close the server socket
+    close(server_sock);
+    printf("Server shutting down.\n");
+    return 0;
+}
