@@ -1,0 +1,256 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <time.h>
+#include <pthread.h>
+#include <errno.h>
+
+#define MAX_NUM 100
+#define PORT 8080
+#define SERVER_IP "127.0.0.1"
+#define BUFFER_SIZE 1024
+
+#define MAX_RETRIES 5
+#define RETRY_DELAY 2
+
+int client_socket;
+struct sockaddr_in server_addr;
+int my_bhoots = 5;
+int opponent_bhoots = 5;
+int game_over = 0;
+int player_index; // Add this global variable to store the player's index
+int my_correct_answers = 0, opponent_correct_answers = 0;
+
+// Add this function to clear the screen
+void clear_screen() {
+#ifdef _WIN32
+    system("cls");
+#else
+    system("clear");
+#endif
+}
+
+// Add this function to display ASCII art bhoots
+void display_bhoots(int count, int y_position) {
+    const char *bhoot_art[] = {
+       
+        
+        "      .-.      ",
+        "     (o.o)     ",
+        "      |=|      ",
+        "     __|__     ",
+        "   //.=|=.\\\\   ",
+        "  // .=|=. \\\\  ",
+    };
+    int bhoot_height = 6;  // Number of lines in the bhoot ASCII art
+
+    for (int i = 0; i < count; i++) {
+        for (int j = 0; j < bhoot_height; j++) {
+            printf("\033[%d;%dH%s", y_position + j, i * 12 + 1, bhoot_art[j]);
+        }
+    }
+}
+
+void connect_to_server() {
+    int retries = 0;
+    while (retries < MAX_RETRIES) {
+        if ((client_socket = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+            perror("Socket creation error");
+            exit(EXIT_FAILURE);
+        }
+
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(PORT);
+
+        if (inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr) <= 0) {
+            perror("Invalid address/ Address not supported");
+            exit(EXIT_FAILURE);
+        }
+
+        printf("Attempting to connect to server (attempt %d)...\n", retries+1);
+        if (connect(client_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+            if (errno == ECONNREFUSED) {
+                perror("Connection failed");
+                close(client_socket);
+                retries++;
+                sleep(RETRY_DELAY);
+                continue;
+            } else {
+                perror("Connection failed");
+                exit(EXIT_FAILURE);
+            }
+        } else {
+            break;
+        }
+    }
+
+    if (retries == MAX_RETRIES) {
+        printf("Failed to connect after %d attempts. Exiting.\n", MAX_RETRIES);
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Connected to server. Waiting for player index...\n");
+
+    // Receive player index from server
+    char index_buffer[2] = {0};
+    ssize_t bytes_received = recv(client_socket, index_buffer, sizeof(index_buffer) - 1, 0);
+    if (bytes_received <= 0) {
+        perror("Failed to receive player index");
+        close(client_socket);
+        exit(1);
+    }
+    index_buffer[bytes_received] = '\0';
+    player_index = atoi(index_buffer);
+    printf("You are Player %d\n", player_index + 1);
+
+    printf("Waiting for the start signal...\n");
+
+    // Wait for the start signal
+    char start_buffer[10] = {0};
+    bytes_received = recv(client_socket, start_buffer, sizeof(start_buffer) - 1, 0);
+    if (bytes_received <= 0) {
+        perror("Failed to receive start signal");
+        close(client_socket);
+        exit(1);
+    }
+    start_buffer[bytes_received] = '\0';
+    if (strcmp(start_buffer, "START") == 0) {
+        printf("Both players connected. The game is starting!\n");
+    } else {
+        printf("Unexpected start signal. Exiting.\n");
+        exit(1);
+    }
+}
+
+void send_to_server(int value) {
+    char buffer[10];
+    snprintf(buffer, sizeof(buffer), "%d", value);
+    send(client_socket, buffer, strlen(buffer), 0);
+}
+
+void *receive_updates(void *arg) {
+    char buffer[BUFFER_SIZE];
+    int read_size;
+
+    while ((read_size = recv(client_socket, buffer, BUFFER_SIZE, 0)) > 0) {
+        buffer[read_size] = '\0';
+        int score1, score2, correct1, correct2;
+        sscanf(buffer, "%d %d %d %d", &score1, &score2, &correct1, &correct2);
+        
+        if (player_index == 0) {
+            my_bhoots = score1;
+            opponent_bhoots = score2;
+            my_correct_answers = correct1;
+            opponent_correct_answers = correct2;
+        } else {
+            my_bhoots = score2;
+            opponent_bhoots = score1;
+            my_correct_answers = correct2;
+            opponent_correct_answers = correct1;
+        }
+
+        if (my_bhoots == 0 || opponent_bhoots == 0) {
+            game_over = 1;
+            break;
+        }
+    }
+
+    if (read_size == 0) {
+        printf("Server disconnected\n");
+    } else if (read_size == -1) {
+        perror("recv failed");
+    }
+
+    game_over = 1;
+    return NULL;
+}
+
+int main() {
+    srand(time(NULL));
+    
+    connect_to_server();
+    
+    pthread_t update_thread;
+    if (pthread_create(&update_thread, NULL, receive_updates, NULL) < 0) {
+        perror("Could not create update thread");
+        return 1;
+    }
+    
+    // The game loop will now start only after receiving the START signal
+    while (!game_over) {
+        clear_screen();
+        
+        // Display ASCII bhoots instead of numbers
+        printf("\033[H\033[J");  // Clear screen and move cursor to top-left
+        printf("Your bhoots:\n");
+        display_bhoots(my_bhoots, 2);
+        printf("\n\nOpponent bhoots:\n");
+        display_bhoots(opponent_bhoots, 10);
+
+        printf("\n\nYour score: %d correct | Opponent score: %d correct\n\n", 
+               my_correct_answers, opponent_correct_answers);
+        
+        if (my_bhoots == 0 || opponent_bhoots == 0) {
+            printf("Game over! Waiting for final results...\n");
+            sleep(2);
+            game_over = 1;
+            break;
+        }
+        
+        int num1 = rand() % 100 + 1;
+        int num2 = rand() % 100 + 1;
+        int correct_answer = num1 + num2;
+        
+        printf("What is %d + %d? ", num1, num2);
+        int user_answer;
+        char input[100];
+        
+        if (fgets(input, sizeof(input), stdin) == NULL) {
+            printf("Error reading input. Please try again.\n");
+            continue;
+        }
+        
+        if (sscanf(input, "%d", &user_answer) != 1) {
+            printf("Invalid input. Please enter a number.\n");
+            continue;
+        }
+        
+        if (user_answer == correct_answer) {
+            printf("Correct! One bhoot will be transferred to your opponent.\n");
+            send_to_server(1);
+        } else {
+            printf("Incorrect. The correct answer was %d. You keep your bhoots.\n", correct_answer);
+            send_to_server(0);
+        }
+        
+         // Add a short delay to see the result
+    }
+
+    // ... rest of the code ...
+    
+    // Wait for the update thread to finish
+    pthread_join(update_thread, NULL);
+    
+    clear_screen();
+    printf("Game over!\n");
+    printf("Final scores:\n");
+    printf("You: %d bhoots, %d correct answers\n", my_bhoots, my_correct_answers);
+    printf("Opponent: %d bhoots, %d correct answers\n", opponent_bhoots, opponent_correct_answers);
+    
+    if (my_bhoots == 0) {
+        printf("Congratulations! You won by getting rid of all your bhoots!\n");
+    } else if (opponent_bhoots == 0) {
+        printf("You lost! Your opponent got rid of all their bhoots first.\n");
+    } else if (my_bhoots == 10) {
+        printf("You lost! You accumulated too many bhoots.\n");
+    } else {
+        printf("Congratulations! You won! Your opponent accumulated too many bhoots.\n");
+    }
+    
+    close(client_socket);
+    
+    return 0;
+}
